@@ -1,4 +1,4 @@
-/* expert_ffn.h — the routed-expert FFN kernel shared by the MoE engines.
+﻿/* expert_ffn.h â€” the routed-expert FFN kernel shared by the MoE engines.
  *
  * One weight layout, one activation contract, one way of running a layer:
  *
@@ -45,6 +45,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
@@ -63,7 +64,7 @@ static inline int    xf_groups(int I)    { return I / XF_BLOCK; }
 static inline int    xf_layout_ok(int I) { return I > 0 && (I % XF_BLOCK) == 0; }
 
 /* Repack one row from the "signed pairs" container layout (byte j = element
- * 2j in the low nibble, 2j+1 in the high nibble, two's-complement 4-bit — the
+ * 2j in the low nibble, 2j+1 in the high nibble, two's-complement 4-bit â€” the
  * qwen36 converter's pack_int4) into planar unsigned. src and dst may not
  * overlap. I % 64 == 0. */
 static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, int I) {
@@ -114,17 +115,49 @@ static inline int xf_get(const uint8_t *row, int i) {
 
 /* Quantize x[I] to int8 with one scale (amax/127), and the per-block sums as
  * f32 (exact: |sum| <= 64*127). Returns the scale. */
-static inline float xf_act_i8(const float *x, int I, int8_t *xq, float *xsum) {
-    float am = 0.f;
-    for (int i = 0; i < I; i++) { float a = fabsf(x[i]); if (a > am) am = a; }
-    float s = am > 0.f ? am / 127.f : 1.f, inv = 1.f / s;
-    for (int i = 0; i < I; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
-    for (int g = 0; g < I / XF_BLOCK; g++) {
-        int32_t t = 0;
-        for (int i = 0; i < XF_BLOCK; i++) t += xq[g * XF_BLOCK + i];
-        xsum[g] = (float)t;
+/* BABA_CPU_HOTPATH_V2 */
+static inline int xf_env_on(const char *name){const char *e=getenv(name);return e&&e[0]=='1'&&e[1]==0;}
+static inline float xf_act_i8_scalar(const float*x,int I,int8_t*xq,float*xsum){
+    float am=0.f;for(int i=0;i<I;i++){float a=fabsf(x[i]);if(a>am)am=a;}
+    float s=am>0.f?am/127.f:1.f,inv=1.f/s;
+    for(int i=0;i<I;i++)xq[i]=(int8_t)lrintf(x[i]*inv);
+    for(int g=0;g<I/XF_BLOCK;g++){int32_t t=0;for(int i=0;i<XF_BLOCK;i++)t+=xq[g*XF_BLOCK+i];xsum[g]=(float)t;}
+    return s;
+}
+#if defined(__AVX2__)
+static inline int32_t xf_sum_i8_32(__m256i v){
+    const __m256i o8=_mm256_set1_epi8(1),o16=_mm256_set1_epi16(1);
+    __m256i p16=_mm256_maddubs_epi16(o8,v),p32=_mm256_madd_epi16(p16,o16);
+    __m128i a=_mm_add_epi32(_mm256_castsi256_si128(p32),_mm256_extracti128_si256(p32,1));
+    a=_mm_hadd_epi32(a,a);a=_mm_hadd_epi32(a,a);return _mm_cvtsi128_si32(a);
+}
+static inline float xf_act_i8_avx2(const float*x,int I,int8_t*xq,float*xsum){
+    float am=0.f;int i=0;const __m256 sign=_mm256_set1_ps(-0.0f);__m256 vmax=_mm256_setzero_ps();
+    for(;i+8<=I;i+=8)vmax=_mm256_max_ps(vmax,_mm256_andnot_ps(sign,_mm256_loadu_ps(x+i)));
+    float tmp[8];_mm256_storeu_ps(tmp,vmax);for(int k=0;k<8;k++)if(tmp[k]>am)am=tmp[k];
+    for(;i<I;i++){float a=fabsf(x[i]);if(a>am)am=a;}
+    float s=am>0.f?am/127.f:1.f,inv=1.f/s;const __m256 vinv=_mm256_set1_ps(inv);i=0;
+    for(;i+32<=I;i+=32){
+      __m256i a=_mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x+i),vinv));
+      __m256i b=_mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x+i+8),vinv));
+      __m256i c=_mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x+i+16),vinv));
+      __m256i d=_mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x+i+24),vinv));
+      __m256i ab=_mm256_packs_epi32(a,b),cd=_mm256_packs_epi32(c,d),q=_mm256_packs_epi16(ab,cd);
+      q=_mm256_permutevar8x32_epi32(q,_mm256_setr_epi32(0,4,1,5,2,6,3,7));
+      _mm256_storeu_si256((__m256i*)(xq+i),q);
+    }
+    for(;i<I;i++)xq[i]=(int8_t)lrintf(x[i]*inv);
+    for(int g=0;g<I/XF_BLOCK;g++){const int8_t*p=xq+(size_t)g*XF_BLOCK;
+      xsum[g]=(float)(xf_sum_i8_32(_mm256_loadu_si256((const __m256i*)p))+xf_sum_i8_32(_mm256_loadu_si256((const __m256i*)(p+32))));
     }
     return s;
+}
+#endif
+static inline float xf_act_i8(const float*x,int I,int8_t*xq,float*xsum){
+#if defined(__AVX2__)
+    if(xf_env_on("Q38_XF_SIMD_ACT"))return xf_act_i8_avx2(x,I,xq,xsum);
+#endif
+    return xf_act_i8_scalar(x,I,xq,xsum);
 }
 
 /* ---- scalar reference kernels (the numerics contract) --------------------- */
@@ -303,6 +336,10 @@ static inline void xf_down_rows(float *y, const XfExpert *e, const XfAct *h, int
         const uint8_t *wd = e->d4 + (size_t)r * rb; const float *sd = e->ds + (size_t)r * ng;
         y[r] = mode ? xf_dot_i8(wd, sd, h->xq, h->xsum, h->sx, F) : xf_dot_f32(wd, sd, h->x, F);
     }
+}static inline void xf_down_accum_rows(float*y,const XfExpert*e,const XfAct*h,float route,int F,int r0,int r1,int mode){
+    size_t rb=xf_row_bytes(F);int ng=xf_groups(F);
+    for(int r=r0;r<r1;r++){const uint8_t*wd=e->d4+(size_t)r*rb;const float*sd=e->ds+(size_t)r*ng;
+      float v=mode?xf_dot_i8(wd,sd,h->xq,h->xsum,h->sx,F):xf_dot_f32(wd,sd,h->x,F);y[r]+=route*v;}
 }
 
 /* ---- one layer ---------------------------------------------------------------
@@ -371,7 +408,7 @@ static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, i
     int rowsH = (H + cH - 1) / cH; rowsH = (rowsH + 7) & ~7; cH = (H + rowsH - 1) / rowsH;
 
     /* phase 1: gate+up for every (expert, chunk), all rows routed to that expert */
-    #pragma omp parallel for schedule(dynamic, 1)
+    #pragma omp parallel for schedule(runtime)
     for (int it = 0; it < nu * cF; it++) {
         int e = it / cF, c = it % cF;
         int r0 = c * rowsF, r1 = r0 + rowsF; if (r1 > F) r1 = F;
@@ -388,27 +425,28 @@ static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, i
         xf_swiglu(h + (size_t)i * F, g + (size_t)i * F, u + (size_t)i * F, F);
         if (mode) hsx[i] = xf_act_i8(h + (size_t)i * F, F, hq + (size_t)i * F, hsum + (size_t)i * (F / XF_BLOCK));
     }
-    /* phase 2: down for every (expert, chunk) */
-    #pragma omp parallel for schedule(dynamic, 1)
-    for (int it = 0; it < nu * cH; it++) {
-        int e = it / cH, c = it % cH;
-        int r0 = c * rowsH, r1 = r0 + rowsH; if (r1 > H) r1 = H;
-        for (int i = head[e]; i >= 0; i = next[i]) {
-            XfAct a = { h + (size_t)i * F, hq + (size_t)i * F, hsum + (size_t)i * (F / XF_BLOCK), mode ? hsx[i] : 0.f };
-            xf_down_rows(ctb + (size_t)i * H, experts[i], &a, F, r0, r1, mode);
+    if(S==1 && xf_env_on("Q38_XF_FUSED_DOWN")){
+        memset(out,0,(size_t)H*sizeof(float));
+        #pragma omp parallel for schedule(runtime)
+        for(int c=0;c<cH;c++){
+            int r0=c*rowsH,r1=r0+rowsH;if(r1>H)r1=H;
+            for(int k=0;k<K;k++){int i=k;if(idx[i]<0||!experts[i])continue;
+                XfAct a={h+(size_t)i*F,hq+(size_t)i*F,hsum+(size_t)i*(F/XF_BLOCK),mode?hsx[i]:0.f};
+                xf_down_accum_rows(out,experts[i],&a,val[i],F,r0,r1,mode);}
         }
-    }
-    /* rank-order sum per token: out[s] = sum_k val[s][k] * ctb[s][k] */
-    #pragma omp parallel for schedule(static)
-    for (int s = 0; s < S; s++) {
-        float *os = out + (size_t)s * H;
-        memset(os, 0, (size_t)H * sizeof(float));
-        for (int k = 0; k < K; k++) {
-            int i = s * K + k; if (idx[i] < 0 || !experts[i]) continue;
-            float w = val[i]; const float *c = ctb + (size_t)i * H;
-            for (int d = 0; d < H; d++) os[d] += w * c[d];
+    }else{
+        #pragma omp parallel for schedule(runtime)
+        for(int it=0;it<nu*cH;it++){
+            int e=it/cH,c=it%cH,r0=c*rowsH,r1=r0+rowsH;if(r1>H)r1=H;
+            for(int i=head[e];i>=0;i=next[i]){XfAct a={h+(size_t)i*F,hq+(size_t)i*F,hsum+(size_t)i*(F/XF_BLOCK),mode?hsx[i]:0.f};
+                xf_down_rows(ctb+(size_t)i*H,experts[i],&a,F,r0,r1,mode);}
         }
+        #pragma omp parallel for schedule(static)
+        for(int s=0;s<S;s++){float*os=out+(size_t)s*H;memset(os,0,(size_t)H*sizeof(float));
+            for(int k=0;k<K;k++){int i=s*K+k;if(idx[i]<0||!experts[i])continue;float w=val[i];const float*cc=ctb+(size_t)i*H;
+                for(int d=0;d<H;d++)os[d]+=w*cc[d];}}
     }
 }
 
 #endif /* COLI_EXPERT_FFN_H */
+

@@ -89,6 +89,12 @@ int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
+/* BABA_Q38_CUDA_PIPE_API: decode fan-out. Upload x once, launch N resident
+ * dense GEMVs from the same device x, sync once, then download their outputs. */
+int  qt_dense_multi_same_x(const int *handles, float **ys, const int *Os,
+                           int count, const float *x, int I);
+/* Fused resident SwiGLU MLP: down(silu(gate(x))*up(x)), one host round trip. */
+int  qt_dense_mlp3(int gate_h,int up_h,int down_h,float *y,const float *x,int S);
 int  qt_dense_count(void);
 
 /* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
@@ -158,6 +164,8 @@ static inline int  qt_dnproj_matmul_batch(int a,float*b,const float*c,int d,int 
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dense_multi_same_x(const int*a,float**b,const int*c,int d,const float*e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dense_mlp3(int a,int b,int c,float*d,const float*e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}
 static inline int  qt_ready(void){return 0;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
@@ -174,3 +182,4 @@ static inline void qt_stats(void){}
 
 #endif /* COLI_CUDA */
 #endif /* QWEN36_TIER_H */
+

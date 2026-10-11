@@ -148,6 +148,7 @@ static void qt_aff_restore(const qt_affmask *m){ (void)m; }
 static int  qt_aff_count_self(void){ return 0; }
 #endif
 static int G_uploader_cpus;   /* CPUs the uploader thread may run on (0 = unknown) */
+static int G_static_sages;    /* fixed monastery: no runtime promotion/swaps */
 
 static void *uploader(void *arg){
     (void)arg;
@@ -540,6 +541,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
     memset(&G,0,sizeof G);
     { const char *e=getenv("QT_UPLOAD_SYNC"); G_upload_sync=e&&*e&&*e!='0'; }
+    { const char *e=getenv("QT_STATIC_SAGES"); G_static_sages=e&&*e&&*e!='0'; }
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
      * COLI_PLACE before the automatic placement has decided anything, and a
@@ -760,6 +762,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.on=1;
     fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
             G.ndev, G.exp_bytes/1048576.0);
+    if(G_static_sages) fprintf(stderr,"[qtier] STATIC SAGES: promotion/LFRU disabled\\n");
     /* The launcher and coli doctor recognise a Windows CUDA_DLL build by this
      * literal in the binary (they cannot read an import table for a DLL
      * loaded at run time); without it a working GPU build of this engine read
@@ -841,6 +844,42 @@ int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
 }
 int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
     return qt_dense_matmul_batch(h, y, x, 1, I, O);
+}
+
+/* BABA_Q38_CUDA_PIPE_IMPL
+ * The ordinary dense entry point performs H2D -> GEMV -> D2H for every matrix.
+ * Qwen3.8 has several projections sharing the exact same x. Keep x on-device
+ * across that fan-out and pay one upload + one synchronization instead. */
+int qt_dense_multi_same_x(const int *handles, float **ys, const int *Os,
+                          int count, const float *x, int I){
+    if(!handles||!ys||!Os||!x||I<=0||count<2||count>7)return 0;
+    int h0=handles[0];
+    if(h0<0||h0>=G_dense_n||!G_dense[h0].on)return 0;
+    int dev=G_dense[h0].dev;
+    for(int i=0;i<count;i++){
+        int h=handles[i];
+        if(h<0||h>=G_dense_n||!G_dense[h].on||G_dense[h].dev!=dev||Os[i]<=0)return 0;
+    }
+    float *xd=coli_cuda_pipe_scratch(dev,18,(size_t)I*sizeof(float));
+    if(!xd||!coli_cuda_pipe_upload(dev,xd,x,(size_t)I*sizeof(float)))return 0;
+    float *yd[7]={0};
+    for(int i=0;i<count;i++){
+        yd[i]=coli_cuda_pipe_scratch(dev,19+i,(size_t)Os[i]*sizeof(float));
+        if(!yd[i]||!coli_cuda_pipe_gemm(G_dense[handles[i]].t,yd[i],xd,1))return 0;
+    }
+    if(!coli_cuda_pipe_sync(dev))return 0;
+    for(int i=0;i<count;i++)
+        if(!coli_cuda_pipe_download(dev,yd[i],ys[i],(size_t)Os[i]*sizeof(float)))return 0;
+    return 1;
+}
+
+int qt_dense_mlp3(int gh,int uh,int dh,float *y,const float *x,int S){
+    if(S<=0||!x||!y||gh<0||uh<0||dh<0||
+       gh>=G_dense_n||uh>=G_dense_n||dh>=G_dense_n)return 0;
+    if(!G_dense[gh].on||!G_dense[uh].on||!G_dense[dh].on)return 0;
+    int dev=G_dense[gh].dev;
+    if(G_dense[uh].dev!=dev||G_dense[dh].dev!=dev)return 0;
+    return coli_cuda_expert_mlp(G_dense[gh].t,G_dense[uh].t,G_dense[dh].t,y,x,S);
 }
 int qt_dense_count(void){ return G_dense_n; }
 
@@ -943,7 +982,7 @@ void qt_note(int layer,int eid,
     if(G_fp8_stream){
         if(s->heat<0xFFFFFFFFu) s->heat++;
         stream_point(s,g4,u4,d4,gs,us,ds);
-        stream_promote_locked(layer,eid);
+        if(!G_static_sages) stream_promote_locked(layer,eid);
         stream_forget(s);
         pthread_mutex_unlock(&G.mx);
         return;
@@ -1083,6 +1122,7 @@ void qt_fill_wait(void){
  * vs hottest non-resident. Decay every 1024 ticks so an old workload cannot
  * permanently own the tier; admission uses the shared tier.h contract. */
 static void qt_lfru_tick_locked(void){
+    if(G_static_sages) return;
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
     if(!(G.tick%1024))
@@ -1261,3 +1301,4 @@ void qt_shutdown(void){
 }
 
 #endif /* COLI_CUDA */
+
